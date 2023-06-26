@@ -1,0 +1,215 @@
+---
+title: "Detection of outlier SNPs based on temporal differentiation using SLiM simulations"
+output: html_document
+---
+```{r setup,message = F,warning = F}
+library(tidyverse)
+library(qvalue)
+library(reshape)
+library(ggpubr)
+library(vcfR)
+library(microbenchmark)
+library(matrixStats)
+```
+### 1.  Loading datasets
+
+- **temporal F~ST~ datasets**\
+F~ST~ were calculated between time points for being compared to\
+F~ST~ values simulated 5000 times under genetic drift using SLiM
+- **VCFs recording variable postions for the first time point (2076 SNPs)**\
+Used by SLIM for simulating allele frequency trajectories
+- **Tables from outlier tests using outflank and TempoDiff**\
+To identify whether SNPs were shared among methods
+
+```{r}
+files <- c("High_Ne_HLG_FST_real_5000simulations.txt",
+           "High_Ne_ROS_FST_real_5000simulations.txt",
+           "High_Ne_QUI_FST_real_5000simulations.txt")
+FST <- lapply(files, function(x) read.table(x, header = T, stringsAsFactors = F)) 
+
+obj.vcfR <- vcfR::read.vcfR("VCF_2067_SNPs_at_T1_3pops.vcf", verbose = FALSE)
+
+df_TempDiff <- read.table("Temporal_outliers_TempoDiff_qval0.10.txt", header = T,
+stringsAsFactors = F)
+df_OutFLANK <- read.table("Temporal_outliers_outflank_qval0.10.txt", header = T, stringsAsFactors = F)
+```
+
+### 2. Calculting P-value for each of the three populations
+Proportion of simulations with F~ST~ values equal or larger to the\
+observed F~ST~ after being corrected for multiple testing
+```{r}
+POP <- c("HLG","ROS","QUI")
+n = 5000
+alpha = 0.10
+
+df_POP_FST_count <- list()
+N_observations <-list()
+qval <- list()
+outliers_HighFST <- list()
+header <- c("CHROM","POS","real_FST",paste(rep("simu",n),seq(1,n,1),sep = ""))
+
+for (i in 1: length(POP)){
+  
+  POP_FST <- as.data.frame(FST[[i]])
+  colnames(POP_FST) <- header
+
+  POP_FST_count <- POP_FST %>%
+  group_by(CHROM,POS) %>%
+  dplyr::count(POP_FST[,4:(n+3)] >= real_FST)
+  df_POP_FST_count[[i]] <- data.frame(as.matrix(POP_FST_count,ncol=(n+3)))
+  df_POP_FST_count[[i]] <- df_POP_FST_count[[i]][,3:(n+2)]
+
+  df_POP_FST_count[[i]]$count <- apply(df_POP_FST_count[[i]] , 1, function(x) sum(x==1,na.rm = TRUE))
+  colnames(df_POP_FST_count[[i]]) <- c(paste(rep("simu",n),seq(1,n,1),sep = ""),"count_FSTsim>FSTreal")
+  
+  Na_count <- apply(df_POP_FST_count[[i]] , 1, function(x) sum(is.na(x)))
+  N_observations[[i]] <- (n - Na_count)
+  
+  df_POP_FST_count[[i]]$Pvalue_highFST  <- df_POP_FST_count[[i]]$`count_FSTsim>FSTreal`/N_observations[[i]]
+  
+  qval[[i]] <- qvalue(df_POP_FST_count[[i]]$Pvalue_highFST)$qvalues
+  outliers_HighFST[[i]] <- which(qval[[i]] < alpha)
+  print(paste(POP[[i]],"number of outliers (pvalue corrected):",length(outliers_HighFST[[i]])))
+  
+  }
+```
+```{r,echo = FALSE}
+for (i in 1: length(POP)){
+  txt <- paste(POP[[i]])
+  plot(qval[[i]], main= txt, xlab = "SNPs", ylab = "qvalue",cex = .7, col = "grey")
+  points(outliers_HighFST[[i]],qval[[i]][outliers_HighFST[[i]]], pch = 3, cex = .7, col = "red")
+}
+```
+
+### 3. Reporting and filtering outlier SNPs previously identified using a qvalue threshold
+```{r}
+CHROM_POS<-data.frame(seq(1,length(getCHROM(obj.vcfR))), getCHROM(obj.vcfR),getPOS(obj.vcfR),getID(obj.vcfR) ,qval[[1]],qval[[2]],qval[[3]])
+colnames(CHROM_POS) <- c("n","CHROM","POS","ID", "qval_HLG", "qval_ROS", "qval_QUI")
+
+outliers_SNP_pop <- list()
+
+for (i in 1: length(POP)){ 
+  outlier_SNP <-filter(CHROM_POS, n %in% outliers_HighFST[[i]])
+  outliers_SNP_pop[[i]] <- cbind(outlier_SNP, rep(POP[[i]],length(outliers_HighFST[[i]])))
+}
+
+outliers_df_highFST <- rbind(outliers_SNP_pop[[1]],outliers_SNP_pop[[2]],outliers_SNP_pop[[3]])
+colnames(outliers_df_highFST) <- c("n","CHROM","POS","ID", "qval_HLG", "qval_ROS", "qval_QUI","pop_detected")
+
+  #report the total number of outlier over populations
+  outliers_df_highFST_unique <-outliers_df_highFST[!duplicated(outliers_df_highFST$n), ]
+  print(paste("Total number of outlier over populations",length(unique(outliers_df_highFST$ID))))
+  
+  #report the number of SNPs detected twice in different populatons 
+  occ_SNPs <- table(unlist(outliers_df_highFST$ID))
+  occurences <- melt(occ_SNPs)
+  
+  multiple_occ <- occurences %>%
+    filter(value >= 2)
+  
+  multiple_occ_pop <-filter(outliers_df_highFST, ID %in% multiple_occ[,1])  
+  multiple_occ_pop <-multiple_occ_pop[
+    order(multiple_occ_pop[,1]),]
+```
+
+### 4. Reporting  the upper limit of  neutral expectation
+99% centile of simulated F~ST~ values for each SNP
+```{r, message = F, warning = F}
+pop_TempFST <- list()
+for (i in 1:length(POP)){
+  
+quantile0.01 <-rowQuantiles(as.matrix(FST[[i]][1:n+3]), probs=0.01, na.rm = TRUE)
+quantile99 <-rowQuantiles(as.matrix(FST[[i]][1:n+3]), probs=0.99, na.rm = TRUE)
+
+df_pop <-data.frame(CHROM_POS,FST[[i]][,3],quantile0.01,quantile99)
+names(df_pop)[8] <- "TempFST"
+
+    df_TempDiff_pop<-df_TempDiff%>%filter(pop == POP[[i]])
+    
+    df_OutFLANK_pop <- df_OutFLANK%>%filter(pop == POP[[i]])
+    
+    df_pop <- df_pop%>%
+              mutate(SLiM_simulations= ID %in% outliers_SNP_pop[[i]]$ID,
+                     TempoDiff= ID %in% df_TempDiff_pop$ID,
+                     OutFLANK = ID %in% df_OutFLANK_pop$ID)
+    
+      df_pop[df_pop == "FALSE"] <- 0
+      df_pop[df_pop == "TRUE"] <- 1   
+      df_pop <- df_pop[,c(1:4,8:13)]
+
+    df_subset <- df_pop%>%
+      mutate(twotest= rowSums(.[8:10],na.rm = T))
+    
+    df_neutre <- df_subset%>% filter(twotest ==0)%>%
+      filter(quantile0.01 != "NA")
+    
+    df_two_tests <- df_subset%>%filter(twotest ==2)
+    df_three_tests <- df_subset%>%filter(twotest ==3)
+    
+    df_SLiM_simulations_uniq <- df_subset%>%
+      filter(SLiM_simulations ==1 & TempoDiff ==0)
+    
+pop_TempFST[[i]] <-ggplot(df_neutre, aes(x = n, y = quantile99))+
+  geom_line(color = "darkgreen",size = 0.01, alpha = 0.4)+
+  geom_line(aes(x = n, y = quantile0.01), color = "darkgreen",size = 0.01, alpha = 0.4)+
+  geom_point(data = df_neutre,aes(x = n, y = TempFST),colour="grey84",size = 1,shape = 4)+
+    geom_point(data = df_SLiM_simulations_uniq,aes(x = n, y = TempFST),fill = "grey",size = 2,shape = 25)+
+    geom_point(data = df_two_tests,aes(x = n, y = TempFST),fill = "purple",size = 2.5,shape = 25)+
+    geom_point(data = df_three_tests,aes(x = n, y = TempFST),fill = "red",size = 2.5,shape = 25)+
+  scale_y_continuous(limits = c(-0.05,0.25),breaks = c(0,0.05,0.10,0.15,0.20,0.25),name = expression(F[ST]))+
+  scale_x_continuous(breaks = c(1,500,1000,1500,2067),name = 'SNPs')+
+  theme(axis.text.x=element_text(colour="black", size = 12,angle = 45,hjust=0.95,vjust=0.9),
+        axis.title = element_text(colour="black", size=12),
+        axis.text.y=element_text(colour="black", size = 12),
+        panel.background = element_rect(fill="white"),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(colour="black", fill=NA, size=0.5),
+        strip.text = element_text(colour="black", size=10),
+        legend.position = "bottom",
+        legend.text = element_text())
+}
+
+#HLG 
+pop_TempFST[[1]] <- pop_TempFST[[1]] + scale_x_continuous(name = '',expand = c(0.01,0.01)) + theme(axis.text.x=element_blank())
+#ROS
+pop_TempFST[[2]] <- pop_TempFST[[2]] +  scale_x_continuous(name = '',expand = c(0.01,0.01))+ theme(axis.text.x=element_blank())
+#QUI
+pop_TempFST[[3]] <- pop_TempFST[[3]] + scale_x_continuous(name = 'SNPs',expand = c(0.01,0.01))
+
+```
+
+```{r eval= T, echo =T}
+plot(ggarrange(pop_TempFST[[1]], ggparagraph(text=" ", face = "italic", size = 10, color = "black"), 
+          pop_TempFST[[2]], ggparagraph(text=" ", face = "italic", size = 10, color = "black"), 
+          pop_TempFST[[3]], ncol = 1, nrow = 5, labels=c("A", "", "B", "", "C"), heights=c(1.5,0.01,1.5,0.01,1.80), widths=c(1, 1, 1, 1, 1), common.legend = TRUE, legend="bottom" ))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+**Figure 3. Temporal F~ST~ per SNP are compared to the upper limit of the neutral expectation based on the high Ne scenario. The green line represents the 99% quantile of F~ST~ values expected under genetic drift alone, determined from 5 000 simulations for (A) HLG, (B) ROS, and (C) QUI. Outlier SNPs that are significant after correction for multiple comparisons and detected only by the simulation framework are represented by grey triangles. Those detected by two or three methods are represented by purple and red triangles, respectively. Grey crosses indicate putatively neutral SNPs that were not detected by outlier tests**
+
+```{r, echo = F}
+sessionInfo()
+```
+
+
+
