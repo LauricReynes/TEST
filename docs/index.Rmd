@@ -10,6 +10,7 @@ library(ggpubr)
 library(vcfR)
 library(microbenchmark)
 library(matrixStats)
+library(rlang)
 ```
 ### 1.  Loading datasets
 
