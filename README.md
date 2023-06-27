@@ -1,2 +1,2 @@
-# Reproductive tutorial for the detection of outlier SNPs based on temporal differentiation
+# A tutorial for reproducing outlier tests based on temporal differentiation 
 https://lauricreynes.github.io/TEST/
